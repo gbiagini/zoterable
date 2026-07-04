@@ -1,0 +1,49 @@
+name: release
+
+# Builds standalone binaries and attaches them to a GitHub Release whenever a
+# version tag (e.g. v0.1.0) is pushed:
+#
+#   git tag v0.1.0
+#   git push origin v0.1.0
+#
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          tar -C target/${{ matrix.target }}/release -czf \
+            zoterable-${{ matrix.target }}.tar.gz zoterable
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: zoterable-${{ matrix.target }}.tar.gz
