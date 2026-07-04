@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -8,25 +9,50 @@ use crate::config;
 use crate::remarkable::Remarkable;
 use crate::zotero::{Item, Zotero};
 
-#[derive(Default, Serialize, Deserialize)]
-struct State {
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct LibraryState {
     /// Zotero library version at the last completed sync; only items modified
     /// after this are fetched.
     #[serde(default)]
     last_library_version: u64,
     /// Zotero attachment key -> item version at last successful upload.
+    #[serde(default)]
     synced: HashMap<String, u64>,
 }
 
+#[derive(Default, Serialize, Deserialize)]
+struct State {
+    /// Per-library sync state, keyed by API prefix ("users/…" or "groups/…").
+    #[serde(default)]
+    libraries: HashMap<String, LibraryState>,
+    // Legacy fields from the single-library format; migrated into `libraries`
+    // (under the personal library) on load.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    last_library_version: u64,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    synced: HashMap<String, u64>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 impl State {
-    fn load(path: &std::path::Path) -> Self {
-        fs::read_to_string(path)
+    fn load(path: &Path, user_library: &str) -> Self {
+        let mut state: State = fs::read_to_string(path)
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if state.last_library_version != 0 || !state.synced.is_empty() {
+            let lib = state.libraries.entry(user_library.to_string()).or_default();
+            lib.last_library_version = lib.last_library_version.max(state.last_library_version);
+            lib.synced.extend(std::mem::take(&mut state.synced));
+            state.last_library_version = 0;
+        }
+        state
     }
 
-    fn save(&self, path: &std::path::Path) -> Result<()> {
+    fn save(&self, path: &Path) -> Result<()> {
         fs::write(path, serde_json::to_string_pretty(self)?)?;
         Ok(())
     }
@@ -34,103 +60,133 @@ impl State {
 
 pub fn run(dry_run: bool) -> Result<()> {
     let cfg = config::load()?;
-    let zotero = Zotero::new(&cfg.zotero_user_id, &cfg.zotero_api_key);
+    let zotero = Zotero::new(&cfg.zotero_api_key);
 
     let state_path = config::state_path()?;
-    let mut state = State::load(&state_path);
+    let mut state = State::load(&state_path, &cfg.user_library());
 
-    println!(
-        "Fetching Zotero PDF attachments changed since library version {}…",
-        state.last_library_version
-    );
-    let (attachments, library_version) = zotero.pdf_attachments(state.last_library_version)?;
-
-    // Only never-seen attachments are uploaded. Re-uploading a known key would
-    // create a duplicate document on the reMarkable (the upload endpoint has
-    // no replace semantics), so metadata-only edits just refresh the record.
-    let (new, updated): (Vec<&Item>, Vec<&Item>) = attachments
-        .iter()
-        .partition(|item| !state.synced.contains_key(&item.key));
-    println!(
-        "{} changed attachment(s): {} new, {} already on the tablet.",
-        attachments.len(),
-        new.len(),
-        updated.len()
-    );
-
-    if dry_run {
-        for item in new {
-            println!("would upload: {}", display_name(&zotero, item));
-        }
-        return Ok(());
-    }
-
-    for item in &updated {
-        state.synced.insert(item.key.clone(), item.version);
-    }
-
+    let mut remarkable: Option<Remarkable> = None;
     let mut failures = 0usize;
-    if !new.is_empty() {
-        let remarkable = Remarkable::connect()?;
+
+    for library in cfg.libraries() {
+        let mut lib = state.libraries.get(&library).cloned().unwrap_or_default();
+        println!(
+            "[{library}] fetching PDF attachments changed since library version {}…",
+            lib.last_library_version
+        );
+        let (attachments, library_version) =
+            zotero.pdf_attachments(&library, lib.last_library_version)?;
+
+        // Only never-seen attachments are uploaded. Re-uploading a known key
+        // would create a duplicate document on the reMarkable (the upload
+        // endpoint has no replace semantics), so metadata-only edits just
+        // refresh the record.
+        let (new, updated): (Vec<&Item>, Vec<&Item>) = attachments
+            .iter()
+            .partition(|item| !lib.synced.contains_key(&item.key));
+        println!(
+            "[{library}] {} changed attachment(s): {} new, {} already on the tablet.",
+            attachments.len(),
+            new.len(),
+            updated.len()
+        );
+
+        if dry_run {
+            for item in new {
+                println!("would upload: {}", display_name(&zotero, &library, item));
+            }
+            continue;
+        }
+
+        for item in &updated {
+            lib.synced.insert(item.key.clone(), item.version);
+        }
+
+        let mut lib_failures = 0usize;
         for item in new {
-            let name = display_name(&zotero, item);
-            let result = zotero
-                .download(&item.key)
-                .and_then(|bytes| remarkable.upload_pdf(&name, bytes));
-            match result {
+            let name = display_name(&zotero, &library, item);
+            let bytes = match zotero.download(&library, &item.key) {
+                Ok(Some(bytes)) => bytes,
+                // No file in Zotero storage — nothing to upload. Not recorded
+                // as synced, so it is retried automatically if the PDF is
+                // later uploaded to Zotero (its item version will change).
+                Ok(None) => {
+                    eprintln!("skipped (no PDF stored in Zotero yet): {name}");
+                    continue;
+                }
+                Err(err) => {
+                    lib_failures += 1;
+                    eprintln!("FAILED: {name}: {err:#}");
+                    continue;
+                }
+            };
+            let remarkable = match &remarkable {
+                Some(r) => r,
+                None => remarkable.insert(Remarkable::connect()?),
+            };
+            match remarkable.upload_pdf(&name, bytes) {
                 Ok(()) => {
                     println!("uploaded: {name}");
-                    state.synced.insert(item.key.clone(), item.version);
+                    lib.synced.insert(item.key.clone(), item.version);
+                    state.libraries.insert(library.clone(), lib.clone());
                     state.save(&state_path)?;
                 }
                 Err(err) => {
-                    failures += 1;
+                    lib_failures += 1;
                     eprintln!("FAILED: {name}: {err:#}");
                 }
             }
         }
+
+        // Only advance the version when everything uploaded, so failed items
+        // are picked up again on the next run.
+        if lib_failures == 0 {
+            lib.last_library_version = library_version;
+        }
+        failures += lib_failures;
+        state.libraries.insert(library.clone(), lib);
+        state.save(&state_path)?;
     }
 
     if failures > 0 {
-        // Leave last_library_version alone so the failed items are picked up
-        // again on the next run.
-        state.save(&state_path)?;
         bail!("{failures} upload(s) failed — they will be retried on the next sync");
     }
-    state.last_library_version = library_version;
-    state.save(&state_path)?;
     Ok(())
 }
 
-/// Record every PDF attachment currently in the library as already synced,
-/// without uploading anything. After this, `sync` only sends future additions.
+/// Record every PDF attachment currently in the configured libraries as
+/// already synced, without uploading anything. After this, `sync` only sends
+/// future additions.
 pub fn baseline() -> Result<()> {
     let cfg = config::load()?;
-    let zotero = Zotero::new(&cfg.zotero_user_id, &cfg.zotero_api_key);
+    let zotero = Zotero::new(&cfg.zotero_api_key);
 
     let state_path = config::state_path()?;
-    let mut state = State::load(&state_path);
+    let mut state = State::load(&state_path, &cfg.user_library());
 
-    println!("Fetching all Zotero PDF attachments…");
-    let (attachments, library_version) = zotero.pdf_attachments(0)?;
-    let already = state.synced.len();
-    for item in &attachments {
-        state.synced.insert(item.key.clone(), item.version);
+    for library in cfg.libraries() {
+        println!("[{library}] fetching all PDF attachments…");
+        let (attachments, library_version) = zotero.pdf_attachments(&library, 0)?;
+        let lib = state.libraries.entry(library.clone()).or_default();
+        let already = lib.synced.len();
+        for item in &attachments {
+            lib.synced.insert(item.key.clone(), item.version);
+        }
+        lib.last_library_version = library_version;
+        println!(
+            "[{library}] marked {} attachment(s) as synced ({} were already recorded).",
+            attachments.len(),
+            already
+        );
     }
-    state.last_library_version = library_version;
     state.save(&state_path)?;
-    println!(
-        "Marked {} attachment(s) as synced ({} were already recorded). \
-         Future `zoterable sync` runs will only upload newly added PDFs.",
-        attachments.len(),
-        already
-    );
+    println!("Future `zoterable sync` runs will only upload newly added PDFs.");
     Ok(())
 }
 
 /// Build "Author - Year - Title" from the attachment's parent item, falling
 /// back to the attachment's own filename when there is no usable parent.
-fn display_name(zotero: &Zotero, item: &Item) -> String {
+fn display_name(zotero: &Zotero, library: &str, item: &Item) -> String {
     let fallback = item
         .data
         .filename
@@ -142,7 +198,7 @@ fn display_name(zotero: &Zotero, item: &Item) -> String {
     let Some(parent_key) = &item.data.parent_item else {
         return fallback;
     };
-    let Ok(parent) = zotero.item(parent_key) else {
+    let Ok(parent) = zotero.item(library, parent_key) else {
         return fallback;
     };
 

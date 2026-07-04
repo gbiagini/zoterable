@@ -10,6 +10,23 @@ pub struct Config {
     pub zotero_user_id: String,
     /// API key with library read access
     pub zotero_api_key: String,
+    /// Numeric IDs of group libraries to sync in addition to the personal
+    /// library. The API key needs group read access for these.
+    #[serde(default)]
+    pub zotero_group_ids: Vec<String>,
+}
+
+impl Config {
+    /// API path prefixes of all libraries to sync ("users/…" and "groups/…").
+    pub fn libraries(&self) -> Vec<String> {
+        let mut libraries = vec![self.user_library()];
+        libraries.extend(self.zotero_group_ids.iter().map(|id| format!("groups/{id}")));
+        libraries
+    }
+
+    pub fn user_library(&self) -> String {
+        format!("users/{}", self.zotero_user_id)
+    }
 }
 
 pub fn config_dir() -> Result<PathBuf> {
@@ -52,6 +69,11 @@ const TEMPLATE: &str = "\
 # both from https://www.zotero.org/settings/keys
 zotero_user_id = \"\"
 zotero_api_key = \"\"
+
+# Optional: numeric IDs of group libraries to sync too (the number in the
+# group's URL, https://www.zotero.org/groups/<id>/<name>). The API key must
+# have group read access enabled.
+zotero_group_ids = []
 ";
 
 pub fn init() -> Result<()> {
