@@ -21,6 +21,12 @@ Then:
 1. Create an API key (library read access) at <https://www.zotero.org/settings/keys>
    and fill in `zotero_user_id` and `zotero_api_key` in the config file that
    `init` created.
+
+   To also sync group libraries, list their numeric IDs (the number in the
+   group's URL, `https://www.zotero.org/groups/<id>/<name>`) in
+   `zotero_group_ids`, e.g. `zotero_group_ids = ["1234567"]`, and make sure
+   the API key has group read access ("Per Group Permissions" when editing
+   the key).
 2. Get a one-time pairing code at <https://my.remarkable.com/device/browser/connect>
    and run `zoterable pair <code>` (codes expire after a few minutes).
 

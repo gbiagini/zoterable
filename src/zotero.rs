@@ -7,7 +7,6 @@ const PAGE_SIZE: usize = 100;
 
 pub struct Zotero {
     client: Client,
-    user_id: String,
     api_key: String,
 }
 
@@ -48,17 +47,17 @@ pub struct Creator {
 }
 
 impl Zotero {
-    pub fn new(user_id: &str, api_key: &str) -> Self {
+    pub fn new(api_key: &str) -> Self {
         Self {
             client: Client::new(),
-            user_id: user_id.to_string(),
             api_key: api_key.to_string(),
         }
     }
 
-    fn get(&self, path_and_query: &str) -> RequestBuilder {
+    /// `library` is an API path prefix: "users/<id>" or "groups/<id>".
+    fn get(&self, library: &str, path_and_query: &str) -> RequestBuilder {
         self.client
-            .get(format!("{API}/users/{}/{path_and_query}", self.user_id))
+            .get(format!("{API}/{library}/{path_and_query}"))
             .header("Zotero-API-Key", &self.api_key)
             .header("Zotero-API-Version", "3")
     }
@@ -68,18 +67,26 @@ impl Zotero {
     /// the current library version, for use as the next `since`. Linked-file
     /// attachments are skipped because their content lives outside Zotero
     /// storage.
-    pub fn pdf_attachments(&self, since: u64) -> Result<(Vec<Item>, u64)> {
+    pub fn pdf_attachments(&self, library: &str, since: u64) -> Result<(Vec<Item>, u64)> {
         let mut items: Vec<Item> = Vec::new();
         let mut library_version = since;
         let mut start = 0;
         loop {
             let response = self
-                .get(&format!(
-                    "items?itemType=attachment&since={since}&limit={PAGE_SIZE}&start={start}"
-                ))
+                .get(
+                    library,
+                    &format!(
+                        "items?itemType=attachment&since={since}&limit={PAGE_SIZE}&start={start}"
+                    ),
+                )
                 .send()?
                 .error_for_status()
-                .context("Zotero item listing failed — check zotero_user_id and zotero_api_key")?;
+                .with_context(|| {
+                    format!(
+                        "Zotero item listing for {library} failed — check the IDs in the config \
+                         and, for groups, that the API key has group read access"
+                    )
+                })?;
             if let Some(version) = response
                 .headers()
                 .get("Last-Modified-Version")
@@ -106,22 +113,22 @@ impl Zotero {
         Ok((items, library_version))
     }
 
-    pub fn item(&self, key: &str) -> Result<Item> {
+    pub fn item(&self, library: &str, key: &str) -> Result<Item> {
         Ok(self
-            .get(&format!("items/{key}"))
+            .get(library, &format!("items/{key}"))
             .send()?
             .error_for_status()
-            .with_context(|| format!("could not fetch Zotero item {key}"))?
+            .with_context(|| format!("could not fetch Zotero item {library}/{key}"))?
             .json()?)
     }
 
     /// Download an attachment's file content (follows the redirect to storage).
-    pub fn download(&self, key: &str) -> Result<Vec<u8>> {
+    pub fn download(&self, library: &str, key: &str) -> Result<Vec<u8>> {
         let response = self
-            .get(&format!("items/{key}/file"))
+            .get(library, &format!("items/{key}/file"))
             .send()?
             .error_for_status()
-            .with_context(|| format!("could not download attachment {key}"))?;
+            .with_context(|| format!("could not download attachment {library}/{key}"))?;
         Ok(response.bytes()?.to_vec())
     }
 }
