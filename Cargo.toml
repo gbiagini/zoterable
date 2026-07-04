@@ -1,0 +1,16 @@
+[package]
+name = "zoterable"
+version = "0.1.0"
+edition = "2024"
+description = "Sync PDF attachments from Zotero to a reMarkable tablet via their cloud APIs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+uuid = { version = "1", features = ["v4"] }
