@@ -1,13 +1,23 @@
+use std::cell::Cell;
+use std::thread;
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result};
-use reqwest::blocking::{Client, RequestBuilder};
+use reqwest::StatusCode;
+use reqwest::blocking::{Client, RequestBuilder, Response};
 use serde::Deserialize;
 
 const API: &str = "https://api.zotero.org";
 const PAGE_SIZE: usize = 100;
+/// How many times to retry a request that returned 429/503 before giving up.
+const MAX_RETRIES: u32 = 5;
 
 pub struct Zotero {
     client: Client,
     api_key: String,
+    /// When set, the next request is held until this instant to honor a
+    /// `Backoff` header the API returned on an earlier response.
+    backoff_until: Cell<Option<Instant>>,
 }
 
 #[derive(Deserialize)]
@@ -51,6 +61,7 @@ impl Zotero {
         Self {
             client: Client::new(),
             api_key: api_key.to_string(),
+            backoff_until: Cell::new(None),
         }
     }
 
@@ -60,6 +71,46 @@ impl Zotero {
             .get(format!("{API}/{library}/{path_and_query}"))
             .header("Zotero-API-Key", &self.api_key)
             .header("Zotero-API-Version", "3")
+    }
+
+    /// Send a request while honoring Zotero's rate-limit signals: wait out any
+    /// pending `Backoff` before sending, retry on `429`/`503` after the
+    /// server's `Retry-After` delay, and record any new `Backoff` for the next
+    /// call. Returns the raw response; callers apply `error_for_status`.
+    fn send(&self, builder: RequestBuilder) -> Result<Response> {
+        if let Some(until) = self.backoff_until.take() {
+            if let Some(remaining) = until.checked_duration_since(Instant::now()) {
+                thread::sleep(remaining);
+            }
+        }
+
+        let mut attempt = 0;
+        loop {
+            let request = builder
+                .try_clone()
+                .context("Zotero request could not be retried")?;
+            let response = request.send()?;
+
+            // A `Backoff` header asks us to slow down subsequent requests.
+            if let Some(secs) = header_secs(&response, "backoff") {
+                self.backoff_until
+                    .set(Some(Instant::now() + Duration::from_secs(secs)));
+            }
+
+            let status = response.status();
+            let rate_limited = status == StatusCode::TOO_MANY_REQUESTS
+                || status == StatusCode::SERVICE_UNAVAILABLE;
+            if rate_limited && attempt < MAX_RETRIES {
+                let wait = header_secs(&response, "retry-after").unwrap_or(1);
+                eprintln!(
+                    "Zotero rate-limited (HTTP {status}); waiting {wait}s before retrying…"
+                );
+                thread::sleep(Duration::from_secs(wait));
+                attempt += 1;
+                continue;
+            }
+            return Ok(response);
+        }
     }
 
     /// PDF attachments stored in the library that were added or modified after
@@ -73,13 +124,12 @@ impl Zotero {
         let mut start = 0;
         loop {
             let response = self
-                .get(
+                .send(self.get(
                     library,
                     &format!(
                         "items?itemType=attachment&since={since}&limit={PAGE_SIZE}&start={start}"
                     ),
-                )
-                .send()?
+                ))?
                 .error_for_status()
                 .with_context(|| {
                     format!(
@@ -115,8 +165,7 @@ impl Zotero {
 
     pub fn item(&self, library: &str, key: &str) -> Result<Item> {
         Ok(self
-            .get(library, &format!("items/{key}"))
-            .send()?
+            .send(self.get(library, &format!("items/{key}")))?
             .error_for_status()
             .with_context(|| format!("could not fetch Zotero item {library}/{key}"))?
             .json()?)
@@ -127,8 +176,8 @@ impl Zotero {
     /// the item exists but its PDF was never uploaded to Zotero's cloud, so
     /// there is nothing to fetch.
     pub fn download(&self, library: &str, key: &str) -> Result<Option<Vec<u8>>> {
-        let response = self.get(library, &format!("items/{key}/file")).send()?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
+        let response = self.send(self.get(library, &format!("items/{key}/file")))?;
+        if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
         let response = response
@@ -136,4 +185,14 @@ impl Zotero {
             .with_context(|| format!("could not download attachment {library}/{key}"))?;
         Ok(Some(response.bytes()?.to_vec()))
     }
+}
+
+/// Parse a header whose value is a whole number of seconds. Zotero sends both
+/// `Backoff` and `Retry-After` as integer seconds.
+fn header_secs(response: &Response, name: &str) -> Option<u64> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse().ok())
 }
