@@ -46,6 +46,9 @@ impl Remarkable {
         let session_token = client
             .post(format!("{AUTH_HOST}/token/json/2/user/new"))
             .bearer_auth(device_token.trim())
+            // The auth frontend rejects bodiless POSTs with 411 Length
+            // Required; an empty body forces a Content-Length: 0 header.
+            .body("")
             .send()?
             .error_for_status()
             .context("could not refresh the reMarkable session token — try re-pairing")?
