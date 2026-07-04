@@ -28,7 +28,7 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         run: |
@@ -44,6 +44,6 @@ jobs:
             zoterable-${{ matrix.target }}.tar.gz zoterable
 
       - name: Attach to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: zoterable-${{ matrix.target }}.tar.gz
