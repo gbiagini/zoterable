@@ -104,15 +104,27 @@ pub fn run(dry_run: bool) -> Result<()> {
 
         let mut lib_failures = 0usize;
         for item in new {
+            let name = display_name(&zotero, &library, item);
+            let bytes = match zotero.download(&library, &item.key) {
+                Ok(Some(bytes)) => bytes,
+                // No file in Zotero storage — nothing to upload. Not recorded
+                // as synced, so it is retried automatically if the PDF is
+                // later uploaded to Zotero (its item version will change).
+                Ok(None) => {
+                    eprintln!("skipped (no PDF stored in Zotero yet): {name}");
+                    continue;
+                }
+                Err(err) => {
+                    lib_failures += 1;
+                    eprintln!("FAILED: {name}: {err:#}");
+                    continue;
+                }
+            };
             let remarkable = match &remarkable {
                 Some(r) => r,
                 None => remarkable.insert(Remarkable::connect()?),
             };
-            let name = display_name(&zotero, &library, item);
-            let result = zotero
-                .download(&library, &item.key)
-                .and_then(|bytes| remarkable.upload_pdf(&name, bytes));
-            match result {
+            match remarkable.upload_pdf(&name, bytes) {
                 Ok(()) => {
                     println!("uploaded: {name}");
                     lib.synced.insert(item.key.clone(), item.version);

@@ -123,12 +123,17 @@ impl Zotero {
     }
 
     /// Download an attachment's file content (follows the redirect to storage).
-    pub fn download(&self, library: &str, key: &str) -> Result<Vec<u8>> {
-        let response = self
-            .get(library, &format!("items/{key}/file"))
-            .send()?
+    /// Returns `None` when Zotero has no file stored for the attachment (404):
+    /// the item exists but its PDF was never uploaded to Zotero's cloud, so
+    /// there is nothing to fetch.
+    pub fn download(&self, library: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        let response = self.get(library, &format!("items/{key}/file")).send()?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let response = response
             .error_for_status()
             .with_context(|| format!("could not download attachment {library}/{key}"))?;
-        Ok(response.bytes()?.to_vec())
+        Ok(Some(response.bytes()?.to_vec()))
     }
 }
